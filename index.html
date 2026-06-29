@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Online Bouncing Sword Duel</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            background-color: #1a1a1a;
+            color: #ffffff;
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #setupPanel {
+            margin-bottom: 15px;
+            background: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        input, button {
+            padding: 8px;
+            font-size: 14px;
+            border-radius: 4px;
+            border: none;
+            margin: 5px;
+        }
+        button {
+            background-color: #4d94ff;
+            color: white;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        #scoreBoard {
+            display: flex;
+            gap: 40px;
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .p1-score { color: #ff4d4d; }
+        .p2-score { color: #4d94ff; }
+        canvas {
+            border: 4px solid #ffffff;
+            background-color: #111111;
+        }
+        .controls {
+            margin-top: 15px;
+            font-size: 14px;
+            color: #aaa;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="setupPanel">
+        <div id="myIdDisplay">Your ID: Loading...</div>
+        <input type="text" id="peerIdInput" placeholder="Enter Friend's ID">
+        <button id="connectBtn">Connect to Friend</button>
+        <div id="status" style="color: #ffcc00; margin-top: 5px;">Waiting for connection...</div>
+    </div>
+
+    <div id="scoreBoard">
+        <div class="p1-score">Player 1 (Red): <span id="p1Score">0</span> | HP: <span id="p1Hp">10</span></div>
+        <div class="p2-score">Player 2 (Blue): <span id="p2Score">0</span> | HP: <span id="p2Hp">10</span></div>
+    </div>
+
+    <canvas id="gameCanvas" width="800" height="500"></canvas>
+
+    <div class="controls">
+        Use <b>A</b> and <b>D</b> (or Left/Right Arrows) to rotate your sword!
+    </div>
+
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
+
+        // Game Config
+        const PLAYER_RADIUS = 20;
+        const SWORD_LENGTH = 35;
+        const MOVE_SPEED = 4;
+        const ROTATION_SPEED = 0.07;
+
+        // Input
+        const keys = {};
+        window.addEventListener("keydown", (e) => keys[e.key] = true);
+        window.addEventListener("keyup", (e) => keys[e.key] = false);
+
+        // Networking Variables
+        let peer;
+        let conn;
+        let amIHost = false; 
+        let isConnected = false;
+
+        class Player {
+            constructor(x, y, vx, vy, color) {
+                this.x = x;
+                this.y = y;
+                this.vx = vx;
+                this.vy = vy;
+                this.color = color;
+                this.angle = 0;
+                this.score = 0;
+                this.hp = 10;
+                this.cooldown = 0;
+            }
+
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+
+                if (this.x - PLAYER_RADIUS < 0) { this.x = PLAYER_RADIUS; this.vx *= -1; }
+                if (this.x + PLAYER_RADIUS > canvas.width) { this.x = canvas.width - PLAYER_RADIUS; this.vx *= -1; }
+                if (this.y - PLAYER_RADIUS < 0) { this.y = PLAYER_RADIUS; this.vy *= -1; }
+                if (this.y + PLAYER_RADIUS > canvas.height) { this.y = canvas.height - PLAYER_RADIUS; this.vy *= -1; }
+
+                if (this.cooldown > 0) this.cooldown--;
+            }
+
+            getSwordTip() {
+                return {
+                    x: this.x + Math.cos(this.angle) * (PLAYER_RADIUS + SWORD_LENGTH),
+                    y: this.y + Math.sin(this.angle) * (PLAYER_RADIUS + SWORD_LENGTH)
+                };
+            }
+
+            draw() {
+                if (this.cooldown % 4 > 2) return;
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.rotate(this.angle);
+
+                // Sword
+                ctx.strokeStyle = "#dddddd";
+                ctx.lineWidth = 5;
+                ctx.beginPath();
+                ctx.moveTo(PLAYER_RADIUS, 0);
+                ctx.lineTo(PLAYER_RADIUS + SWORD_LENGTH, 0);
+                ctx.stroke();
+
+                // Tip
+                ctx.fillStyle = "#ffffff";
+                ctx.beginPath();
+                ctx.arc(PLAYER_RADIUS + SWORD_LENGTH, 0, 4, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Body
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(0, 0, PLAYER_RADIUS, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.strokeStyle = "#ffffff";
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                ctx.restore();
+            }
+        }
+
+        // Initialize players
+        const player1 = new Player(200, 250, MOVE_SPEED, -MOVE_SPEED, "#ff4d4d"); // Host
+        const player2 = new Player(600, 250, -MOVE_SPEED, MOVE_SPEED, "#4d94ff"); // Joiner
+
+        // Math helpers
+        function getDistance(x1, y1, x2, y2) { return Math.sqrt((x2 - x1)**2 + (y2 - y1)**2); }
+
+        function checkCollisions() {
+            // Only the host calculates core physics/scoring to keep things synchronized
+            if (!amIHost) return;
+
+            const tip1 = player1.getSwordTip();
+            const tip2 = player2.getSwordTip();
+
+            if (player2.cooldown === 0 && getDistance(tip1.x, tip1.y, player2.x, player2.y) < PLAYER_RADIUS) {
+                player1.score++; player2.hp--; player2.cooldown = 30;
+                bouncePlayers(player1, player2);
+            }
+            if (player1.cooldown === 0 && getDistance(tip2.x, tip2.y, player1.x, player1.y) < PLAYER_RADIUS) {
+                player2.score++; player1.hp--; player1.cooldown = 30;
+                bouncePlayers(player2, player1);
+            }
+            if (getDistance(player1.x, player1.y, player2.x, player2.y) < PLAYER_RADIUS * 2) {
+                bouncePlayers(player1, player2);
+            }
+        }
+
+        function bouncePlayers(p1, p2) {
+            const tempX = p1.vx; const tempY = p1.vy;
+            p1.vx = p2.vx; p1.vy = p2.vy;
+            p2.vx = tempX; p2.vy = tempY;
+            p1.x += p1.vx; p1.y += p1.vy;
+        }
+
+        // --- Network Setup ---
+        peer = new Peer();
+
+        peer.on('open', (id) => {
+            document.getElementById("myIdDisplay").innerText = "Your ID: " + id;
+        });
+
+        // If someone connects to us (We are the Host / Player 1)
+        peer.on('connection', (connection) => {
+            conn = connection;
+            amIHost = true;
+            setupNetworkEvents();
+        });
+
+        // If we click connect to connect to a friend (We are Player 2)
+        document.getElementById("connectBtn").addEventListener("click", () => {
+            const peerId = document.getElementById("peerIdInput").value;
+            conn = peer.connect(peerId);
+            amIHost = false;
+            setupNetworkEvents();
+        });
+
+        function setupNetworkEvents() {
+            conn.on('open', () => {
+                isConnected = true;
+                document.getElementById("status").innerText = "Connected! Game Starting...";
+                document.getElementById("setupPanel").style.display = "none";
+            });
+
+            conn.on('data', (data) => {
+                if (amIHost) {
+                    // Host receives rotation inputs from Player 2
+                    player2.angle = data.angle;
+                } else {
+                    // Client receives absolute game state updates from Host
+                    player1.x = data.p1.x; player1.y = data.p1.y; player1.angle = data.p1.angle;
+                    player2.x = data.p2.x; player2.y = data.p2.y; player2.angle = data.p2.angle;
+                    player1.score = data.p1.score; player1.hp = data.p1.hp;
+                    player2.score = data.p2.score; player2.hp = data.p2.hp;
+                    player1.cooldown = data.p1.cooldown; player2.cooldown = data.p2.cooldown;
+                }
+            });
+        }
+
+        function updateGame() {
+            if (!isConnected) return;
+
+            if (amIHost) {
+                // Host handles local rotation input
+                if (keys["a"] || keys["ArrowLeft"]) player1.angle -= ROTATION_SPEED;
+                if (keys["d"] || keys["ArrowRight"]) player1.angle += ROTATION_SPEED;
+
+                player1.update();
+                player2.update();
+                checkCollisions();
+
+                // Send complete game data state to Player 2
+                conn.send({
+                    p1: { x: player1.x, y: player1.y, angle: player1.angle, score: player1.score, hp: player1.hp, cooldown: player1.cooldown },
+                    p2: { x: player2.x, y: player2.y, angle: player2.angle, score: player2.score, hp: player2.hp, cooldown: player2.cooldown }
+                });
+            } else {
+                // Client handles local rotation input
+                if (keys["a"] || keys["ArrowLeft"]) player2.angle -= ROTATION_SPEED;
+                if (keys["d"] || keys["ArrowRight"]) player2.angle += ROTATION_SPEED;
+
+                // Send current angle up to the Host
+                conn.send({ angle: player2.angle });
+            }
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (!isConnected) {
+                ctx.fillStyle = "#ffffff";
+                ctx.font = "20px Arial";
+                ctx.textAlign = "center";
+                ctx.fillText("Waiting for players to link IDs...", canvas.width/2, canvas.height/2);
+                return;
+            }
+            player1.draw();
+            player2.draw();
+            
+            document.getElementById("p1Score").innerText = player1.score;
+            document.getElementById("p1Hp").innerText = player1.hp;
+            document.getElementById("p2Score").innerText = player2.score;
+            document.getElementById("p2Hp").innerText = player2.hp;
+        }
+
+        function gameLoop() {
+            updateGame();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        gameLoop();
+    </script>
+</body>
+</html>
